@@ -246,7 +246,7 @@ impl Value{
 		}
 	}
 	/// applies matrix multiplication
-	pub fn matmul(self,r:Value)->Value{
+	pub fn matmul(self,r:Value)->Value{// TODO finish and test
 		let (ld,rd)=(self.dims().len(),r.dims().len());
 		let d=ld.max(rd).max(2);
 		let mut l=self.unsqueeze(0,d.saturating_sub(ld));
@@ -266,11 +266,25 @@ impl Value{
 		(rdims[d-1],rdims[d-2])=(ycols,yrows);
 
 		let (dims,lstrides,rstrides)=(&rdims[..d-2],&l.shape.strides[..d-2],&r.shape.strides[..d-2]);
+		let (lcolstride,lrowstride,rcolstride,rrowstride)=(lstrides[d-2],lstrides[d-1],rstrides[d-2],rstrides[d-1]);
+		let mut yoff=0;
 		let position=&mut ldims[..d-2];
+		let rdata=buffer(&r.buffer,r.count,&r.offset);
+		let ycount:usize=rdims.iter().product();
+		let (ldata,ydata)=buffer_io(&mut l.buffer,l.count,&mut l.offset.clone(),ycount,&mut l.offset);
 
-		// TODO
 		loop{
-
+			let (ldata,rdata)=(&ldata[compute_index(&*position,lstrides)..],&rdata[compute_index(&*position,rstrides)..]);
+			for col in 0..ycols{
+				let rdata=&rdata[col*rrowstride..];
+				for row in 0..yrows{
+					let rdata=&rdata[lcolstride*row..];
+					let mut acc=0.0;
+					for n in 0..shared{acc+=ldata[lrowstride*n]*rdata[rcolstride*n]}
+					ydata[yoff]=acc;
+					yoff+=1;
+				}
+			}
 
 			if dims.iter().zip(position.iter_mut()).all(|(d,x)|{
 				let nextline=d==x;
@@ -282,7 +296,13 @@ impl Value{
 		}
 
 		//TODO squeeze result if ld = 1 and yd = 2
-
+		let mut y=l;
+		y.count=ycount;
+		y.shape.dims=r.shape.dims;
+		y.shape.dims.iter().zip(buffer_mut(&mut y.shape.strides,d,&mut 0)).rev().fold(1,|product,(&dim,stride)|{
+			*stride=product;
+			product*dim
+		});
 		todo!()
 	}
 	/// returns the tensor shape, which contains the dimensions
