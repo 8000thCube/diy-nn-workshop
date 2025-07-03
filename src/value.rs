@@ -16,8 +16,7 @@ fn buffer_io<'a,E:Clone+Default>(buffer:&'a mut Arc<[E]>,count:usize,offset:&mut
 			return (&i[*offset..],&mut o[..outputcount]);
 		}
 	}
-	let b:Vec<E>=buffer[*offset..count+*offset].iter().cloned().chain((0..outputcount).map(|_|E::default())).collect();
-	*buffer=Arc::from(b);
+	*buffer=buffer[*offset..count+*offset].iter().cloned().chain((0..outputcount).map(|_|E::default())).collect();
 	*offset=0;
 	*outputoffset=count;
 	let (i,o)=Arc::get_mut(buffer).unwrap().split_at_mut(count);
@@ -81,11 +80,24 @@ impl Add<f32> for Value{
 	fn add(self,rhs:f32)->Self::Output{self.map(|x|x+rhs)}
 	type Output=Value;
 }
+impl AddAssign<&Value> for Value{
+	fn add_assign(&mut self,rhs:&Value){*self=take(self)+rhs}
+}
+impl AddAssign<Value> for Value{
+	fn add_assign(&mut self,rhs:Value){*self=take(self)+rhs}
+}
 impl AsRef<[usize]> for Shape{
 	fn as_ref(&self)->&[usize]{&self.dims}
 }
 impl AsRef<Self> for Shape{
 	fn as_ref(&self)->&Self{self}
+}
+impl Coordinates{
+	fn from_mem(dims:Arc<[usize]>,mut mem:Arc<[usize]>)->Self{
+		assert_eq!(dims.len(),mem.len());
+		buffer_mut(&mut mem,dims.len(),&mut 0).fill(0);
+		Self{dims,positions:mem,state:0}
+	}
 }
 impl Deref for Shape{
 	fn deref(&self)->&Self::Target{&self.dims}
@@ -95,12 +107,22 @@ impl Iterator for Coordinates{
 	fn next(&mut self)->Option<Self::Item>{
 		let dims=&self.dims;
 		let positions=buffer_mut(&mut self.positions,dims.len(),&mut 0);
+		let state=&mut self.state;
 
-		if dims.iter().zip(positions.iter_mut()).all(|(d,x)|{
-			let nextline=d==x;
-			if nextline{*x=0}else{*x+=1}
+		if *state==0{
+			*state=1;
+			return Some(self.positions.clone());
+		}else if *state==2{
+			return None;
+		}
+
+		if dims.iter().rev().zip(positions.iter_mut().rev()).all(|(d,x)|{
+			*x+=1;
+			let nextline=d<=x;
+			if nextline{*x=0}
 			nextline
 		}){
+			*state=2;
 			None
 		}else{
 			Some(self.positions.clone())
@@ -112,8 +134,20 @@ impl Mul<&Value> for &Value{
 	fn mul(self,rhs:&Value)->Self::Output{self.clone().map_2(Mul::mul,rhs.clone())}
 	type Output=Value;
 }
+impl Mul<&Value> for &f32{
+	fn mul(self,rhs:&Value)->Self::Output{rhs.clone().map(|x|self*x)}
+	type Output=Value;
+}
+impl Mul<&Value> for f32{
+	fn mul(self,rhs:&Value)->Self::Output{rhs.clone().map(|x|self*x)}
+	type Output=Value;
+}
 impl Mul<&Value> for Value{
 	fn mul(self,rhs:&Value)->Self::Output{self.map_2(Mul::mul,rhs.clone())}
+	type Output=Value;
+}
+impl Mul<&f32> for &Value{
+	fn mul(self,rhs:&f32)->Self::Output{self.clone().map(|x|x*rhs)}
 	type Output=Value;
 }
 impl Mul<Value> for &Value{
@@ -122,6 +156,22 @@ impl Mul<Value> for &Value{
 }
 impl Mul<Value> for Value{
 	fn mul(self,rhs:Value)->Self::Output{self.map_2(Mul::mul,rhs)}
+	type Output=Value;
+}
+impl Mul<Value> for &f32{
+	fn mul(self,rhs:Value)->Self::Output{rhs.map(|x|self*x)}
+	type Output=Value;
+}
+impl Mul<Value> for f32{
+	fn mul(self,rhs:Value)->Self::Output{rhs.map(|x|self*x)}
+	type Output=Value;
+}
+impl Mul<f32> for &Value{
+	fn mul(self,rhs:f32)->Self::Output{self.clone().map(|x|x*rhs)}
+	type Output=Value;
+}
+impl Mul<f32> for Value{
+	fn mul(self,rhs:f32)->Self::Output{self.map(|x|x*rhs)}
 	type Output=Value;
 }
 impl Neg for &Value{
@@ -146,8 +196,18 @@ impl Shape{
 
 		self
 	}
+	/// removes the 1 dimensions in range d..d+n
+	pub fn squeeze(self,d:usize,n:usize)->Shape{
+		assert!(d+n<=self.len());
+		if n==0{return self}
+		let (dims,strides)=(&self.dims,&self.strides);
+		let strides=strides[..d].iter().copied().chain(strides[d+n..].iter().copied().zip(dims[d..d+1].iter().copied()).filter(|&(_s,d)|d!=1).map(|(s,_d)|s)).collect();
+		let dims=dims[..d].iter().copied().chain(dims[d..d+n].iter().copied().filter(|&d|d!=1)).chain(dims[d+n..].iter().copied()).collect();
+		Shape{dims,strides}
+	}
 	/// adds n 1 dimensions at postion d
 	pub fn unsqueeze(self,d:usize,n:usize)->Shape{
+		assert!(d<=self.len());
 		if n==0{return self}
 		let (dims,strides)=(&self.dims,&self.strides);
 		let dims=dims[..d].iter().copied().chain((0..n).map(|_|1)).chain(dims[d..].iter().copied()).collect();
@@ -213,7 +273,7 @@ impl Value{
 		let (dims,strides)=(self.shape.dims,self.shape.strides);
 		let data=buffer(&self.buffer,self.count,&self.offset);
 		let positions=Arc::from(vec![0;dims.len()]);
-		Coordinates{dims,positions}.map(|c|data[compute_index(c,&strides)]).collect()
+		Coordinates::from_mem(dims,positions).map(|c|data[compute_index(c,&strides)]).collect()
 	}
 	/// applies the function to each component
 	pub fn map<F:Fn(f32)->f32>(mut self,f:F)->Value{
@@ -235,16 +295,16 @@ impl Value{
 				Value{buffer:r.buffer,count:r.count,offset:r.offset,shape:r.shape}
 			}
 		}else{
-			buffer_mut(&mut r.shape.dims,r.shape.strides.len(),&mut 0).fill(0);
 			let lb=buffer_mut(&mut l.buffer,l.count,&mut l.offset);
 			let rb=&r.buffer[r.offset..r.offset+r.count];
-			(Coordinates{dims:l.shape.dims.clone(),positions:r.shape.dims}).for_each(|c|{
+			Coordinates::from_mem(l.shape.dims.clone(),r.shape.dims).for_each(|c|{
 				let (lx,rx)=(compute_index(&c,&l.shape.strides),compute_index(&c,&r.shape.strides));
 				lb[lx]=f(lb[lx],rb[rx]);
 			});
 			Value{buffer:l.buffer,count:l.count,offset:l.offset,shape:l.shape}
 		}
 	}
+	#[track_caller]
 	/// applies matrix multiplication
 	pub fn matmul(self,r:Value)->Value{// TODO finish and test
 		let (ld,rd)=(self.dims().len(),r.dims().len());
@@ -266,7 +326,7 @@ impl Value{
 		(rdims[d-1],rdims[d-2])=(ycols,yrows);
 
 		let (dims,lstrides,rstrides)=(&rdims[..d-2],&l.shape.strides[..d-2],&r.shape.strides[..d-2]);
-		let (lcolstride,lrowstride,rcolstride,rrowstride)=(lstrides[d-2],lstrides[d-1],rstrides[d-2],rstrides[d-1]);
+		let (lcolstride,lrowstride,rcolstride,rrowstride)=(l.shape.strides[d-2],l.shape.strides[d-1],r.shape.strides[d-2],r.shape.strides[d-1]);
 		let mut yoff=0;
 		let position=&mut ldims[..d-2];
 		let rdata=buffer(&r.buffer,r.count,&r.offset);
@@ -278,7 +338,7 @@ impl Value{
 			for col in 0..ycols{
 				let rdata=&rdata[col*rrowstride..];
 				for row in 0..yrows{
-					let rdata=&rdata[lcolstride*row..];
+					let ldata=&ldata[lcolstride*row..];
 					let mut acc=0.0;
 					for n in 0..shared{acc+=ldata[lrowstride*n]*rdata[rcolstride*n]}
 					ydata[yoff]=acc;
@@ -286,7 +346,7 @@ impl Value{
 				}
 			}
 
-			if dims.iter().zip(position.iter_mut()).all(|(d,x)|{
+			if dims.iter().rev().zip(position.iter_mut().rev()).all(|(d,x)|{
 				let nextline=d==x;
 				if nextline{*x=0}else{*x+=1}
 				nextline
@@ -295,7 +355,6 @@ impl Value{
 			}
 		}
 
-		//TODO squeeze result if ld = 1 and yd = 2
 		let mut y=l;
 		y.count=ycount;
 		y.shape.dims=r.shape.dims;
@@ -303,10 +362,15 @@ impl Value{
 			*stride=product;
 			product*dim
 		});
-		todo!()
+		if ld<1&&d==2{y.squeeze(0,2)}else{y}
 	}
 	/// returns the tensor shape, which contains the dimensions
 	pub fn shape(&self)->Shape{self.shape.clone()}
+	/// removes the 1 dimensions in range d..d+n
+	pub fn squeeze(mut self,d:usize,n:usize)->Value{
+		self.shape=self.shape.squeeze(d,n);
+		self
+	}
 	/// swaps two of the dimensions
 	pub fn swap_dims(mut self,a:usize,b:usize)->Value{
 		self.shape=self.shape.swap_dims(a,b);
@@ -325,7 +389,7 @@ impl Value{
 }
 #[derive(Clone,Debug,Default)]
 /// iterator over tensor positions
-pub struct Coordinates{dims:Arc<[usize]>,positions:Arc<[usize]>}
+pub struct Coordinates{dims:Arc<[usize]>,positions:Arc<[usize]>,state:usize}
 #[derive(Clone,Debug,Default)]
 /// tensor value dimensions
 pub struct Shape{dims:Arc<[usize]>,strides:Arc<[usize]>}
@@ -333,5 +397,5 @@ pub struct Shape{dims:Arc<[usize]>,strides:Arc<[usize]>}
 /// nn layer io value. stores data and dimensions
 pub struct Value{buffer:Arc<[f32]>,count:usize,offset:usize,shape:Shape}
 use std::{
-	ops::{Add,Deref,Mul,Neg,Sub},sync::Arc
+	mem::take,ops::{Add,AddAssign,Deref,Mul,Neg,Sub},sync::Arc
 };
